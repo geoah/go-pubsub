@@ -32,3 +32,45 @@ func Test_PubSub(t *testing.T) {
 		require.Equal(t, "f04", <-sub1.Channel())
 	})
 }
+
+func Test_PubSub_Filters(t *testing.T) {
+	ps := NewPubSub[string]()
+
+	filter1checks := 0
+	filter1hits := 0
+	filter2checks := 0
+	filter2hits := 0
+
+	sub1 := ps.Subscribe("foo", func(s string) bool {
+		filter1checks++
+		if s == "f01" {
+			filter1hits++
+			return true
+		}
+		return false
+	})
+
+	sub2 := ps.Subscribe("foo", func(s string) bool {
+		filter2checks++
+		if s == "f02" {
+			filter2hits++
+			return true
+		}
+		return false
+	})
+
+	t.Run("two subscriptions, ok", func(t *testing.T) {
+		ps.Publish("foo", "f02")
+		require.Equal(t, "f02", <-sub2.Channel())
+	})
+
+	t.Run("one subscription, ok", func(t *testing.T) {
+		ps.Publish("foo", "f01")
+		require.Equal(t, "f01", <-sub1.Channel())
+	})
+
+	require.Equal(t, 2, filter1checks)
+	require.Equal(t, 1, filter1hits)
+	require.Equal(t, 2, filter2checks)
+	require.Equal(t, 1, filter2hits)
+}

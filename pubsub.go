@@ -38,9 +38,12 @@ func (ps *PubSub[Value]) getTopic(topic string) *Topic[Value] {
 }
 
 // Subscribe to a topic
-func (ps *PubSub[Value]) Subscribe(topic string) *Subscription[Value] {
+func (ps *PubSub[Value]) Subscribe(
+	topic string,
+	filters ...func(Value) bool,
+) *Subscription[Value] {
 	t := ps.getTopic(topic)
-	return t.Subscribe()
+	return t.Subscribe(filters...)
 }
 
 // Publish an event to all a topic's subscribers
@@ -52,12 +55,13 @@ func (ps *PubSub[Value]) Publish(topic string, value Value) {
 // Topic contains all the events we are subscribed to.
 type Topic[Value any] struct {
 	lock          sync.RWMutex
-	subscriptions []chan Value
+	subscriptions []*Subscription[Value]
 }
 
 type Subscription[Value any] struct {
-	values <-chan Value
-	cancel chan<- struct{}
+	values  chan Value
+	cancel  chan<- struct{}
+	filters []func(Value) bool
 }
 
 func (s *Subscription[Value]) Cancel() {
@@ -79,25 +83,28 @@ func (s *Subscription[Value]) Next() (Value, error) {
 // NewTopic creates a new topic.
 func NewTopic[Value any]() *Topic[Value] {
 	return &Topic[Value]{
-		subscriptions: []chan Value{},
+		subscriptions: []*Subscription[Value]{},
 	}
 }
 
 // Subscribe to messages published to this topic.
-func (t *Topic[Value]) Subscribe() *Subscription[Value] {
+func (t *Topic[Value]) Subscribe(
+	filters ...func(Value) bool,
+) *Subscription[Value] {
 	t.lock.Lock()
 	defer t.lock.Unlock()
 	values := make(chan Value, 1)
 	cancel := make(chan struct{})
-	t.subscriptions = append(t.subscriptions, values)
 	s := &Subscription[Value]{
-		values: values,
-		cancel: cancel,
+		values:  values,
+		cancel:  cancel,
+		filters: filters,
 	}
 	go func() {
 		<-cancel
 		close(values)
 	}()
+	t.subscriptions = append(t.subscriptions, s)
 	return s
 }
 
@@ -106,8 +113,18 @@ func (t *Topic[Value]) Publish(value Value) {
 	t.lock.RLock()
 	defer t.lock.RUnlock()
 	for _, sub := range t.subscriptions {
+		publish := true
+		for _, filter := range sub.filters {
+			if !filter(value) {
+				publish = false
+				break
+			}
+		}
+		if !publish {
+			continue
+		}
 		select {
-		case sub <- value:
+		case sub.values <- value:
 		default:
 		}
 	}
