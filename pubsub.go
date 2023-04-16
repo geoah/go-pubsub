@@ -3,6 +3,7 @@ package pubsub
 import (
 	"fmt"
 	"sync"
+	"time"
 )
 
 var ErrSubscriptionClosed = fmt.Errorf("subscription closed")
@@ -54,14 +55,23 @@ func (ps *PubSub[Value]) Publish(topic string, value Value) {
 
 // Topic contains all the events we are subscribed to.
 type Topic[Value any] struct {
-	lock          sync.RWMutex
-	subscriptions []*Subscription[Value]
+	lock               sync.RWMutex
+	subscriptions      []*Subscription[Value]
+	defaultAckDeadline time.Duration
+	defaultBufferSize  int
 }
 
 type Subscription[Value any] struct {
-	values  chan Value
-	cancel  chan<- struct{}
-	filters []func(Value) bool
+	ackDeadline time.Duration
+	buffer      chan valueExpiry[Value]
+	values      chan Value
+	cancel      chan<- struct{}
+	filters     []func(Value) bool
+}
+
+type valueExpiry[Value any] struct {
+	value   Value
+	created time.Time
 }
 
 func (s *Subscription[Value]) Cancel() {
@@ -80,10 +90,60 @@ func (s *Subscription[Value]) Next() (Value, error) {
 	return v, nil
 }
 
+func (s *Subscription[Value]) publish(value Value) {
+	for _, f := range s.filters {
+		if !f(value) {
+			return
+		}
+	}
+	s.buffer <- valueExpiry[Value]{
+		value:   value,
+		created: time.Now(),
+	}
+}
+
+func (s *Subscription[Value]) process(cancel <-chan struct{}) {
+	tryPub := func(v valueExpiry[Value]) {
+		select {
+		case <-cancel:
+			close(s.values)
+			return
+		case s.values <- v.value:
+			return
+		case <-time.After(time.Until(v.created.Add(s.ackDeadline))):
+			return
+		}
+	}
+	for {
+		select {
+		case <-cancel:
+			close(s.values)
+			return
+		case v := <-s.buffer:
+			tryPub(v)
+		}
+	}
+}
+
 // NewTopic creates a new topic.
 func NewTopic[Value any]() *Topic[Value] {
 	return &Topic[Value]{
-		subscriptions: []*Subscription[Value]{},
+		subscriptions:      []*Subscription[Value]{},
+		defaultAckDeadline: 0,
+		defaultBufferSize:  1,
+	}
+}
+
+// NewTopicWithOptions creates a new custom topic.
+// WARNING: This is an experimental API and WILL change in the future.
+func NewTopicWithOptions[Value any](
+	ackDeadline time.Duration,
+	bufferSize int,
+) *Topic[Value] {
+	return &Topic[Value]{
+		subscriptions:      []*Subscription[Value]{},
+		defaultAckDeadline: ackDeadline,
+		defaultBufferSize:  bufferSize,
 	}
 }
 
@@ -91,19 +151,28 @@ func NewTopic[Value any]() *Topic[Value] {
 func (t *Topic[Value]) Subscribe(
 	filters ...func(Value) bool,
 ) *Subscription[Value] {
+	return t.SubscribeWithOptions(t.defaultBufferSize, t.defaultAckDeadline, filters...)
+}
+
+// SubscribeWithOptions subscribes to messages published to this topic with
+// custom options.
+// WARNING: This is an experimental API and WILL change in the future.
+func (t *Topic[Value]) SubscribeWithOptions(
+	bufferSize int,
+	ackDeadline time.Duration,
+	filters ...func(Value) bool,
+) *Subscription[Value] {
 	t.lock.Lock()
 	defer t.lock.Unlock()
-	values := make(chan Value, 1)
 	cancel := make(chan struct{})
 	s := &Subscription[Value]{
-		values:  values,
-		cancel:  cancel,
-		filters: filters,
+		ackDeadline: ackDeadline,
+		buffer:      make(chan valueExpiry[Value], bufferSize),
+		values:      make(chan Value),
+		cancel:      cancel,
+		filters:     filters,
 	}
-	go func() {
-		<-cancel
-		close(values)
-	}()
+	go s.process(cancel)
 	t.subscriptions = append(t.subscriptions, s)
 	return s
 }
@@ -113,19 +182,6 @@ func (t *Topic[Value]) Publish(value Value) {
 	t.lock.RLock()
 	defer t.lock.RUnlock()
 	for _, sub := range t.subscriptions {
-		publish := true
-		for _, filter := range sub.filters {
-			if !filter(value) {
-				publish = false
-				break
-			}
-		}
-		if !publish {
-			continue
-		}
-		select {
-		case sub.values <- value:
-		default:
-		}
+		sub.publish(value)
 	}
 }
