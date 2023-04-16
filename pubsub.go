@@ -96,9 +96,13 @@ func (s *Subscription[Value]) publish(value Value) {
 			return
 		}
 	}
-	s.buffer <- valueExpiry[Value]{
+	out := valueExpiry[Value]{
 		value:   value,
 		created: time.Now(),
+	}
+	select {
+	case s.buffer <- out:
+	default:
 	}
 }
 
